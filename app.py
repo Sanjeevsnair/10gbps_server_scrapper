@@ -734,13 +734,7 @@ def hubcloud_extract(url: str) -> List[Dict]:
             "label": label_extras + "[dns-fallback]"
             })
         else:
-            # Unknown server — still return it
-            results.append({
-                "server": "Unknown Server",
-                "quality": quality,
-                "url": link,
-                "label": label_extras
-            })
+           continue
 
     return results
 
@@ -1079,6 +1073,7 @@ async def api_get_links(request: LinksRequest):
                 logger.warning(f"[collect] error: {e}")
 
     # Keep only hubdrive/hubcloud final links (like your previous behavior)
+    # Keep only hubdrive final links (exclude hubcloud)
     filtered = []
     seen = set()
     for item in collected:
@@ -1086,16 +1081,17 @@ async def api_get_links(request: LinksRequest):
         if not url:
             continue
         low = url.lower()
-        if "hubdrive" in low or "hubcloud" in low:
+        if "hubdrive" in low:  # <-- hubcloud excluded
             if url not in seen:
                 filtered.append(url)
                 seen.add(url)
 
-    logger.info(f"Extracted {len(filtered)}  hubdrive/hubcloud links")
+    logger.info(f"Extracted {len(filtered)} hubdrive links")
     return {
         "metadata": metadata,
         "hubdrive_links": filtered
     }
+
 
 # ---- Extract endpoint: from hubdrive/hubcloud to actual server links (FSL / Pixeldrain / etc.) ----
 @app.post("/api/extract", response_model=ExtractedResponse)
@@ -1109,7 +1105,6 @@ def extract_links(req: HubDriveRequest):
             elif "hubdrive" in low:
                 all_links.extend(hubdrive_extract(url))
             else:
-                # Not matched; try mediator decode if it's a mediator anyway
                 resolved = get_redirect_links(url)
                 if "hubcloud" in (resolved or "").lower():
                     all_links.extend(hubcloud_extract(resolved))
@@ -1118,9 +1113,21 @@ def extract_links(req: HubDriveRequest):
         except Exception as e:
             logger.warning(f"[extract] failed for {url}: {e}")
 
-    if not all_links:
+    # Exclude "Unknown Server" entries from the response
+    filtered_links = [
+        x for x in all_links
+        if (x.get("server") or "").strip().lower() != "unknown server"
+    ]
+
+    if not filtered_links:
         raise HTTPException(status_code=404, detail="No video links found.")
-    return {"status": "success", "total_links": len(all_links), "results": all_links}
+
+    return {
+        "status": "success",
+        "total_links": len(filtered_links),
+        "results": filtered_links
+    }
+
 
 # ---- MoviesDrive endpoints ----
 @app.get("/searchx")
