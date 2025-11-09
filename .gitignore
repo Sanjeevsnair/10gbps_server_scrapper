@@ -1,0 +1,5 @@
+/.venv
+/.vscode
+/partial working.py
+/test.py
+/__pycache__
