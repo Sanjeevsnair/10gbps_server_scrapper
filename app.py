@@ -9,13 +9,19 @@ import re
 import tempfile
 import time
 import concurrent.futures
+import threading
 from collections import defaultdict
 from typing import Dict, List, Optional
-from urllib.parse import urljoin, urlparse, urlunparse, urlencode
+from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs, unquote
+from pathlib import Path
+from contextlib import asynccontextmanager
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -59,22 +65,86 @@ def get_cache_dir():
     return "/tmp"
 
 CACHE_DIR = get_cache_dir()
+DOMAINS_CACHE_FILE = Path(CACHE_DIR) / "domains_cache.json"
+DOMAINS_CACHE_TTL = 3600  # 1 hour
 
 # =====================================================================
-# HTTP helpers
+# HTTP helpers with retry logic
 # =====================================================================
 
-_SESSION = requests.Session()
-_SESSION.headers.update(headers)
+def create_session_with_retry():
+    """Create a requests session with automatic retry configuration"""
+    session = requests.Session()
+    
+    # Configure retry strategy
+    retry_strategy = Retry(
+        total=3,  # Total number of retries
+        backoff_factor=1,  # Wait 1, 2, 4 seconds between retries
+        status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+    )
+    
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=20
+    )
+    
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update(headers)
+    
+    return session
+
+_SESSION = create_session_with_retry()
 _DEFAULT_TIMEOUT = 15
 
-def http_get(url: str, referer: Optional[str] = None, allow_redirects: bool = True, timeout: int = _DEFAULT_TIMEOUT) -> requests.Response:
+def http_get(url: str, referer: Optional[str] = None, 
+             allow_redirects: bool = True, 
+             timeout: int = _DEFAULT_TIMEOUT,
+             max_retries: int = 2) -> requests.Response:
+    """HTTP GET with manual retry logic for better error handling"""
     req_headers = dict(headers)
     if referer:
         req_headers["Referer"] = referer
-    resp = _SESSION.get(url, headers=req_headers, allow_redirects=allow_redirects, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = _SESSION.get(
+                url, 
+                headers=req_headers, 
+                allow_redirects=allow_redirects, 
+                timeout=timeout
+            )
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            logger.warning(f"Timeout on attempt {attempt + 1}/{max_retries + 1} for {url}")
+            if attempt < max_retries:
+                time.sleep(1 * (attempt + 1))  # Exponential backoff
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            logger.warning(f"Connection error on attempt {attempt + 1}/{max_retries + 1} for {url}")
+            if attempt < max_retries:
+                time.sleep(1 * (attempt + 1))
+        except requests.exceptions.HTTPError as e:
+            # Don't retry on 4xx errors (except 429)
+            if e.response.status_code < 500 and e.response.status_code != 429:
+                raise
+            last_error = e
+            logger.warning(f"HTTP error {e.response.status_code} on attempt {attempt + 1}/{max_retries + 1}")
+            if attempt < max_retries:
+                time.sleep(1 * (attempt + 1))
+        except Exception as e:
+            last_error = e
+            logger.error(f"Unexpected error on attempt {attempt + 1}/{max_retries + 1}: {e}")
+            if attempt < max_retries:
+                time.sleep(1 * (attempt + 1))
+    
+    # All retries failed
+    raise last_error
 
 def http_head(url: str, referer: Optional[str] = None, allow_redirects: bool = True, timeout: int = 10) -> requests.Response:
     req_headers = dict(headers)
@@ -101,16 +171,66 @@ def is_valid_url(url: str) -> bool:
         return False
 
 # =====================================================================
-# Domains discovery (4KHDHub main URL)
+# Domains discovery with caching (4KHDHub main URL)
 # =====================================================================
 
 def get_domains() -> Dict:
-    try:
-        resp = http_get(DOMAINS_URL)
-        return resp.json()
-    except Exception as e:
-        logger.warning(f"Failed to fetch domains.json: {e}")
-        return {}
+    """Fetch domains with caching and better error handling"""
+    
+    # Try to load from cache first
+    if DOMAINS_CACHE_FILE.exists():
+        try:
+            cache_age = time.time() - DOMAINS_CACHE_FILE.stat().st_mtime
+            if cache_age < DOMAINS_CACHE_TTL:
+                with open(DOMAINS_CACHE_FILE, 'r') as f:
+                    cached_domains = json.load(f)
+                    logger.info(f"Using cached domains (age: {cache_age:.0f}s)")
+                    return cached_domains
+        except Exception as e:
+            logger.warning(f"Failed to read domains cache: {e}")
+    
+    # Try to fetch fresh domains
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                DOMAINS_URL, 
+                headers=headers, 
+                timeout=10
+            )
+            resp.raise_for_status()
+            domains_data = resp.json()
+            
+            # Save to cache
+            try:
+                with open(DOMAINS_CACHE_FILE, 'w') as f:
+                    json.dump(domains_data, f)
+                logger.info("Domains fetched and cached successfully")
+            except Exception as e:
+                logger.warning(f"Failed to cache domains: {e}")
+            
+            return domains_data
+            
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1}/3 to fetch domains failed: {e}")
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    
+    # If all fetching attempts failed, try to use stale cache
+    if DOMAINS_CACHE_FILE.exists():
+        try:
+            with open(DOMAINS_CACHE_FILE, 'r') as f:
+                stale_domains = json.load(f)
+                logger.warning("Using stale cached domains as fallback")
+                return stale_domains
+        except Exception as e:
+            logger.error(f"Failed to read stale cache: {e}")
+    
+    # Ultimate fallback
+    logger.error("All domain fetching methods failed, using hardcoded defaults")
+    return {
+        "4khdhub": DEFAULT_4KHDHUB,
+        "moviesdrive": MOVIESDRIVE_BASE
+    }
 
 domains = get_domains()
 FOURK_MAIN = domains.get("4khdhub") or domains.get("n4khdhub") or DEFAULT_4KHDHUB
@@ -452,8 +572,6 @@ def select_lowest_size_per_quality(variants: List[Dict]) -> List[Dict]:
         selected.append(min_v)
     return sorted(selected, key=lambda x: x.get("quality", 0), reverse=True)
 
-from urllib.parse import urlparse, urljoin, parse_qs, unquote
-
 def _extract_link_param(u: str) -> Optional[str]:
     try:
         parsed = urlparse(u)
@@ -467,6 +585,13 @@ def _extract_link_param(u: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+def get_base_url(url: str) -> str:
+    try:
+        u = urlparse(url)
+        return f"{u.scheme}://{u.netloc}"
+    except Exception:
+        return ""
 
 def _resolve_10gbps(start_url: str, referer: Optional[str], max_hops: int = 8) -> Optional[str]:
     """
@@ -550,7 +675,6 @@ def _resolve_10gbps(start_url: str, referer: Optional[str], max_hops: int = 8) -
 
     return None
 
-
 # =====================================================================
 # HubDrive & HubCloud extractors (requests-based)
 # =====================================================================
@@ -604,13 +728,6 @@ def _hubcloud_get_download_href(real_url: str) -> str:
         return href or ""
     except Exception as e:
         logger.error(f"[hubcloud] Failed to grab #download on {real_url}: {e}")
-        return ""
-
-def get_base_url(url: str) -> str:
-    try:
-        u = urlparse(url)
-        return f"{u.scheme}://{u.netloc}"
-    except Exception:
         return ""
 
 def hubcloud_extract(url: str) -> List[Dict]:
@@ -720,21 +837,21 @@ def hubcloud_extract(url: str) -> List[Dict]:
                 final = _resolve_10gbps(link, referer=href)
             if final:
                 results.append({
-            "server": "10Gbps Server",
-            "quality": quality,
-            "url": final,
-            "label": label_extras
-            })
+                    "server": "10Gbps Server",
+                    "quality": quality,
+                    "url": final,
+                    "label": label_extras
+                })
             else:
-            # return the original button so clients can resolve under a working DNS
+                # return the original button so clients can resolve under a working DNS
                 results.append({
-            "server": "10Gbps Server (unresolved)",
-            "quality": quality,
-            "url": link,
-            "label": label_extras + "[dns-fallback]"
-            })
+                    "server": "10Gbps Server (unresolved)",
+                    "quality": quality,
+                    "url": link,
+                    "label": label_extras + "[dns-fallback]"
+                })
         else:
-           continue
+            continue
 
     return results
 
@@ -982,10 +1099,63 @@ class ExtractedResponse(BaseModel):
     results: List[ExtractedLink]
 
 # =====================================================================
-# FastAPI app
+# FastAPI app with startup/shutdown
 # =====================================================================
 
-app = FastAPI(title="Lumino API (No-Selenium)", description="4KHDHub + HubDrive/HubCloud + MoviesDrive")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    # Startup: warm up connections
+    logger.info("=== Starting Lumino API ===")
+    
+    # Warm up the session by making a simple request
+    def warmup_connections():
+        try:
+            logger.info("Warming up HTTP connections...")
+            # Test connection to 4KHDHub
+            resp = _SESSION.head(FOURK_MAIN, timeout=5)
+            logger.info(f"4KHDHub connection test: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Connection warmup failed (non-critical): {e}")
+        
+        # Pre-fetch domains if not already cached
+        try:
+            if not DOMAINS_CACHE_FILE.exists():
+                logger.info("Pre-fetching domains...")
+                get_domains()
+        except Exception as e:
+            logger.warning(f"Domain pre-fetch failed (non-critical): {e}")
+    
+    # Run warmup in background to not delay startup
+    warmup_thread = threading.Thread(target=warmup_connections, daemon=True)
+    warmup_thread.start()
+    
+    logger.info(f"API ready - 4KHDHub: {FOURK_MAIN}")
+    logger.info(f"Cache directory: {CACHE_DIR}")
+    
+    yield  # Application runs
+    
+    # Shutdown
+    logger.info("=== Shutting down Lumino API ===")
+    _SESSION.close()
+
+app = FastAPI(
+    title="Lumino API (No-Selenium)",
+    description="4KHDHub + HubDrive/HubCloud + MoviesDrive",
+    lifespan=lifespan
+)
+
+# Custom exception handler for better error messages
+@app.exception_handler(requests.exceptions.RequestException)
+async def request_exception_handler(request, exc):
+    logger.error(f"Request error: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "detail": "Upstream service temporarily unavailable. Please retry.",
+            "error_type": type(exc).__name__
+        }
+    )
 
 @app.get("/")
 async def root():
@@ -1005,101 +1175,179 @@ async def health():
 @app.post("/api/search")
 async def api_search(request: SearchRequest):
     logger.info(f"[api_search] {request.query}")
-    results = search_4k(request.query)
-    if not results:
-        raise HTTPException(status_code=404, detail="No results found")
-    return {"results": results}
+    
+    try:
+        results = search_4k(request.query)
+        
+        if not results:
+            return {
+                "status": "success",
+                "count": 0,
+                "results": [],
+                "message": "No results found for this query"
+            }
+        
+        return {
+            "status": "success",
+            "count": len(results),
+            "results": results
+        }
+        
+    except requests.exceptions.Timeout:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Search service timeout. Please retry."
+        )
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cannot connect to search service. Please retry."
+        )
+    except Exception as e:
+        logger.error(f"Search error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Search failed: {str(e)}"
+        )
 
-# ---- 4KHDHub get-links (collect hubdrive/hubcloud mediator-resolved links for a movie/episode) ----
+# ---- 4KHDHub get-links ----
 @app.post("/api/get-links")
 async def api_get_links(request: LinksRequest):
     if not request.url:
         raise HTTPException(status_code=400, detail="URL is required")
 
     logger.info(f"[api_get_links] {request.url}")
-    data = load_4k(request.url)
-    if not data:
-        raise HTTPException(status_code=404, detail="Failed to load content")
+    
+    try:
+        data = load_4k(request.url)
+        
+        if not data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Content not found or failed to load. The URL may be invalid."
+            )
 
-    type_ = data["type"]
-    title = data["title"]
-    logger.info(f"Loaded: {title} ({type_})")
+        type_ = data["type"]
+        title = data["title"]
+        logger.info(f"Loaded: {title} ({type_})")
 
-    metadata = {
-        "title": title,
-        "type": type_,
-        "url": data["url"],
-        "poster": data.get("poster", ""),
-        "year": data.get("year"),
-        "plot": data.get("plot", ""),
-        "tags": data.get("tags", [])
-    }
+        metadata = {
+            "title": title,
+            "type": type_,
+            "url": data["url"],
+            "poster": data.get("poster", ""),
+            "year": data.get("year"),
+            "plot": data.get("plot", ""),
+            "tags": data.get("tags", [])
+        }
 
-    # collect variants
-    variants = []
-    if type_ == "TvSeries":
-        if request.season is None or request.episode is None:
-            raise HTTPException(status_code=400, detail="Season and episode are required for TV series")
-        season = request.season
-        episode = request.episode
-        variants = data["episodes"].get(season, {}).get(episode, [])
+        # Collect variants
+        variants = []
+        if type_ == "TvSeries":
+            if request.season is None or request.episode is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Season and episode are required for TV series"
+                )
+            season = request.season
+            episode = request.episode
+            variants = data["episodes"].get(season, {}).get(episode, [])
+            if not variants:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Episode S{season:02d}E{episode:02d} not found"
+                )
+            metadata["season"] = season
+            metadata["episode"] = episode
+            metadata["episode_name"] = f"S{season:02d}E{episode:02d}"
+        else:
+            if request.season is not None or request.episode is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Season and episode should not be provided for movies"
+                )
+            variants = data.get("variants", [])
+
         if not variants:
-            raise HTTPException(status_code=404, detail=f"Episode S{season:02d}E{episode:02d} not found")
-        metadata["season"] = season
-        metadata["episode"] = episode
-        metadata["episode_name"] = f"S{season:02d}E{episode:02d}"
-    else:
-        if request.season is not None or request.episode is not None:
-            raise HTTPException(status_code=400, detail="Season and episode should not be provided for movies")
-        variants = data.get("variants", [])
+            raise HTTPException(
+                status_code=404,
+                detail="No download variants found for this content"
+            )
 
-    if not variants:
-        raise HTTPException(status_code=404, detail="No variants found")
+        selected = select_lowest_size_per_quality(variants)
+        logger.info(f"Selected {len(selected)} variants")
 
-    selected = select_lowest_size_per_quality(variants)
-    logger.info("Selected variants (lowest size per quality):")
-    for sv in selected:
-        size_gb = sv["size"] if sv["size"] != float("inf") else "Unknown"
-        logger.info(f"- {sv['quality']}p [{size_gb} GB]: {sv['filename'][:100]}...")
+        # Resolve and collect links with timeout protection
+        collected = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            futures = {
+                ex.submit(collect_links_from_variant, sv["links"], sv["quality"]): sv
+                for sv in selected
+            }
+            
+            for f in concurrent.futures.as_completed(futures, timeout=30):
+                try:
+                    collected.extend(f.result())
+                except Exception as e:
+                    logger.warning(f"[collect] error: {e}")
 
-    # Resolve and collect direct hubdrive/hubcloud links
-    collected = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(selected) or 1)) as ex:
-        futures = [ex.submit(collect_links_from_variant, sv["links"], sv["quality"]) for sv in selected]
-        for f in concurrent.futures.as_completed(futures):
-            try:
-                collected.extend(f.result())
-            except Exception as e:
-                logger.warning(f"[collect] error: {e}")
-
-    # Keep only hubdrive/hubcloud final links (like your previous behavior)
-    # Keep only hubdrive final links (exclude hubcloud)
-    filtered = []
-    seen = set()
-    for item in collected:
-        url = item.get("url", "")
-        if not url:
-            continue
-        low = url.lower()
-        if "hubdrive" in low:  # <-- hubcloud excluded
-            if url not in seen:
+        # Filter hubdrive links
+        filtered = []
+        seen = set()
+        for item in collected:
+            url = item.get("url", "")
+            if url and "hubdrive" in url.lower() and url not in seen:
                 filtered.append(url)
                 seen.add(url)
 
-    logger.info(f"Extracted {len(filtered)} hubdrive links")
-    return {
-        "metadata": metadata,
-        "hubdrive_links": filtered
-    }
+        logger.info(f"Extracted {len(filtered)} hubdrive links")
+        
+        return {
+            "status": "success",
+            "metadata": metadata,
+            "hubdrive_links": filtered,
+            "total_links": len(filtered)
+        }
+        
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions as-is
+    except concurrent.futures.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Link collection timeout. Please retry."
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Upstream service timeout. Please retry."
+        )
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cannot connect to content service. Please retry."
+        )
+    except Exception as e:
+        logger.error(f"Get-links error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get links: {str(e)}"
+        )
 
-
-# ---- Extract endpoint: from hubdrive/hubcloud to actual server links (FSL / Pixeldrain / etc.) ----
+# ---- Extract endpoint ----
 @app.post("/api/extract", response_model=ExtractedResponse)
 def extract_links(req: HubDriveRequest):
+    if not req.hubdrive_links:
+        raise HTTPException(
+            status_code=400,
+            detail="No hubdrive links provided"
+        )
+    
     all_links = []
+    failed_count = 0
+    
     for url in req.hubdrive_links:
-        low = (url or "").lower()
         try:
+            low = (url or "").lower()
             if "hubcloud" in low:
                 all_links.extend(hubcloud_extract(url))
             elif "hubdrive" in low:
@@ -1112,22 +1360,32 @@ def extract_links(req: HubDriveRequest):
                     all_links.extend(hubdrive_extract(resolved))
         except Exception as e:
             logger.warning(f"[extract] failed for {url}: {e}")
+            failed_count += 1
+            continue  # Continue processing other links
 
-    # Exclude "Unknown Server" entries from the response
+    # Filter out unknown servers
     filtered_links = [
         x for x in all_links
         if (x.get("server") or "").strip().lower() != "unknown server"
     ]
 
     if not filtered_links:
-        raise HTTPException(status_code=404, detail="No video links found.")
+        if failed_count == len(req.hubdrive_links):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="All link extractions failed. Upstream service may be unavailable."
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No valid download links found."
+        )
 
     return {
         "status": "success",
         "total_links": len(filtered_links),
-        "results": filtered_links
+        "results": filtered_links,
+        "failed_count": failed_count
     }
-
 
 # ---- MoviesDrive endpoints ----
 @app.get("/searchx")
@@ -1152,5 +1410,5 @@ def api_resolve(url: str = Query(..., description="Full moviesdrive.mom item URL
 # =====================================================================
 
 if __name__ == "__main__":
-    logger.info("Starting 4KHDHub API (No-Selenium) on port 7860")
+    logger.info("Starting Lumino API (No-Selenium) on port 7860")
     uvicorn.run(app, host="0.0.0.0", port=7860, log_level="info")
