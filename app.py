@@ -595,6 +595,7 @@ def get_base_url(url: str) -> str:
 
 def _resolve_10gbps(start_url: str, referer: Optional[str], max_hops: int = 8) -> Optional[str]:
     """
+    (Currently unused)
     Follow a few 302s manually until we see a URL with link= param,
     or extract from HTML if available. Never raises; returns None on failure.
     """
@@ -613,7 +614,6 @@ def _resolve_10gbps(start_url: str, referer: Optional[str], max_hops: int = 8) -
         try:
             r = _SESSION.get(current, headers=headers_local, allow_redirects=False, timeout=10)
         except Exception:
-            # DNS / network failure -> try HTML parse fallback once
             try:
                 r2 = _SESSION.get(current, headers=headers_local, allow_redirects=True, timeout=10)
                 html = r2.text
@@ -831,25 +831,14 @@ def hubcloud_extract(url: str) -> List[Dict]:
                 "label": label_extras
             })
         elif "10gbps" in low:
-            # robust extraction of the ultimate ?link= target; survive DNS issues
-            final = _extract_link_param(link)
-            if not final:
-                final = _resolve_10gbps(link, referer=href)
-            if final:
-                results.append({
-                    "server": "10Gbps Server",
-                    "quality": quality,
-                    "url": final,
-                    "label": label_extras
-                })
-            else:
-                # return the original button so clients can resolve under a working DNS
-                results.append({
-                    "server": "10Gbps Server (unresolved)",
-                    "quality": quality,
-                    "url": link,
-                    "label": label_extras + "[dns-fallback]"
-                })
+            # Do NOT try to resolve 10Gbps from backend; just return raw link.
+            # This avoids DNS/timeout issues when the server cannot reach pixel/worker hosts.
+            results.append({
+                "server": "10Gbps Server (unresolved)",
+                "quality": quality,
+                "url": link,
+                "label": label_extras + "[dns-fallback]"
+            })
         else:
             continue
 
