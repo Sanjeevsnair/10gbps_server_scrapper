@@ -1,28 +1,38 @@
-# ---------- Base image ----------
-FROM python:3.11-slim AS base
+# Lightweight base with Python
+FROM python:3.10-slim
 
-# ---------- System setup ----------
+# avoid Python buffering, keep small image
+ENV PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Install OS deps needed for cryptography, lxml/bs4, and building wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    gcc \
+    libssl-dev \
     libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libxml2-dev \
+    libxslt1-dev \
+    ca-certificates \
+    git \
+  && rm -rf /var/lib/apt/lists/*
 
-# ---------- App setup ----------
 WORKDIR /app
 
-# Copy dependencies first (for caching)
-COPY requirements.txt .
+# Copy requirements and install (use --no-cache-dir to keep image small)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy application code
+COPY . /app
 
-# Copy source code
-COPY app.py .
+# Create a non-root user (recommended for security) and own the workdir
+RUN useradd -m appuser && chown -R appuser:appuser /app
+USER appuser
 
-# ---------- Environment ----------
-ENV PORT=7860 \
-    PYTHONUNBUFFERED=1 \
-    EXTRACT_TIMEOUT_SEC=300
-
-# ---------- Run ----------
+# HF Spaces & common configs: expose port used in your script
 EXPOSE 7860
-CMD ["python", "app.py"]
+
+# Start the app with uvicorn. Adjust module:app if your file/module name differs.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--proxy-headers", "--loop", "asyncio", "--timeout-keep-alive", "30"]
