@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -24,10 +25,12 @@ from urllib.parse import (
     parse_qs,
     unquote,
     quote_plus,
+    quote as urlquote,
 )
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+from fastapi.concurrency import run_in_threadpool
 import httpx
 import requests
 from requests.adapters import HTTPAdapter
@@ -42,7 +45,8 @@ import unicodedata  # for accent-insensitive normalization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
+from playwright.async_api import async_playwright
+import html
 
 # =====================================================================
 # Logging
@@ -54,8 +58,40 @@ logger = logging.getLogger("lumino")
 CINEMAOS_API = "https://cinemaos.tech"
 # From Kotlin (kept same)
 GEN_HASH_S = "a8f7e9c2d4b6a1f3e8c9d2t4a7f6e9c2d4z6a1f3e8c9d2b4a7f5e9c2d4b6a1f3"
+BASE_URL = "https://world4ufree.onl"
 
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Mobile Safari/537.36"
+    )
+})
 
+WATCH32 = "https://watch32.sx"
+VIDEOSTR = "https://videostr.net"
+
+VIDEOSTR_HEADERS = {
+    "User-Agent": SESSION.headers["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://videostr.net/",
+    "Origin": "https://videostr.net",
+    "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": BASE_URL,
+}
 # =====================================================================
 # Config (TUNED FOR SPEED) - UPDATED
 # =====================================================================
@@ -240,6 +276,52 @@ def is_blocked_host(url: str) -> bool:
 # =====================================================================
 
 
+def relevance_score(query: str, item: Dict) -> int:
+    """
+    Higher score = better match
+    """
+    score = 0
+
+    q = normalize_title_str(query)
+    title = normalize_title_str(item.get("title", ""))
+
+    # Exact match
+    if title == q:
+        score += 100
+
+    # Full query present
+    if q in title:
+        score += 60
+
+    # Token-based match
+    q_tokens = q.split()
+    t_tokens = title.split()
+    common = set(q_tokens) & set(t_tokens)
+    score += len(common) * 10
+
+    # Sequel number priority (VERY IMPORTANT)
+    m = re.search(r"\b(\d+)\b", q)
+    if m and m.group(1) in title:
+        score += 40
+
+    # Year match
+    if item.get("year") and str(item["year"]) in title:
+        score += 20
+
+    # Penalize base movie when sequel requested
+    if m and m.group(1) not in title:
+        score -= 30
+
+    # Prefer more specific titles
+    score += min(len(title), 60) // 5
+
+    # Slight source bias (optional, tiny)
+    if item.get("source") == "moviesdrive":
+        score += 3
+
+    return score
+
+
 def get_domains() -> Dict:
     if DOMAINS_CACHE_FILE.exists():
         try:
@@ -392,7 +474,7 @@ def titles_match(query_norm: str, candidate_title: str) -> bool:
     return query_simple == cand_simple or query_simple in cand_simple
 
 # =====================================================================
-# Mediator (robust)
+# Mediator (robust, interactive walker)
 # =====================================================================
 
 _MEDIATOR_REGEX = re.compile(
@@ -400,6 +482,14 @@ _MEDIATOR_REGEX = re.compile(
     re.I
 )
 
+# Quick fail hosts seen to be flaky — keep minimal
+_MEDIATOR_QUICK_FAIL_HOSTS = {
+    "shorted.link", "tinyurlpro.xyz"
+}
+# Explicit allowlist for hosts where we want to attempt mediator resolution
+_RESOLVE_ALLOWLIST = {
+    "gadgetsweb.xyz"
+}
 
 def _rot13(s: str) -> str:
     out = []
@@ -422,19 +512,127 @@ def _b64decode_str(s: str) -> str:
         return ""
 
 
-# Quick fail hosts seen to be flaky — add more as needed
-_MEDIATOR_QUICK_FAIL_HOSTS = {
-    "gadgetsweb.xyz", "shorted.link", "tinyurlpro.xyz"
-}
+def _extract_href_from_element(el) -> Optional[str]:
+    """
+    Extract a usable href from an anchor/button/form element or its onclick attribute.
+    """
+    if not el:
+        return None
+    if el.name == "a" and el.has_attr("href"):
+        return el.get("href")
+    # common attributes
+    for attr in ("data-href", "data-src", "href"):
+        if el.has_attr(attr):
+            return el.get(attr)
+    # onclick patterns
+    onclick = el.get("onclick") if el.has_attr("onclick") else None
+    if onclick:
+        # look for location.href = '...'
+        m = re.search(r"location(?:\.href|\s*=\s*window\.location)\s*[:=]?\s*['\"]([^'\"]+)['\"]", onclick, re.I)
+        if m:
+            return m.group(1)
+        # window.open('url', ...)
+        m2 = re.search(r"window\.open\(['\"]([^'\"]+)['\"]", onclick, re.I)
+        if m2:
+            return m2.group(1)
+    return None
+
+
+def _find_candidate_button_href(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    """
+    Look for visible anchors/buttons that indicate 'click to continue', 'continue', 'get links',
+    etc. Return the href or JS-derived URL (may be relative).
+    """
+    btn_text_patterns = re.compile(r"(click to continue|click here to continue|continue|get links|get link|show links|proceed|start download|generate links)", re.I)
+
+    # 1) look for anchor tags with matching visible text
+    for a in soup.find_all("a", href=True):
+        txt = a.get_text(" ", strip=True)
+        if txt and btn_text_patterns.search(txt):
+            href = a.get("href")
+            if href:
+                return urljoin(base_url, href)
+
+    # 2) look for buttons or inputs
+    for b in soup.find_all(["button", "input"]):
+        txt = b.get_text(" ", strip=True) if b.name == "button" else (b.get("value") or "")
+        if txt and btn_text_patterns.search(txt):
+            href = _extract_href_from_element(b)
+            if href:
+                return urljoin(base_url, href)
+
+    # 3) some pages hide link in data attributes
+    for el in soup.select("[data-href], [data-src]"):
+        txt = (el.get_text(" ", strip=True) or "")
+        if txt and btn_text_patterns.search(txt):
+            href = _extract_href_from_element(el)
+            if href:
+                return urljoin(base_url, href)
+
+    # 4) scan scripts for direct location assignments / meta refresh
+    for script in soup.find_all("script"):
+        st = script.string or ""
+        if not st:
+            continue
+        # meta refresh-style in JS
+        m = re.search(r"location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", st, re.I)
+        if m:
+            return urljoin(base_url, m.group(1))
+        m2 = re.search(r"window\.location\s*=\s*['\"]([^'\"]+)['\"]", st, re.I)
+        if m2:
+            return urljoin(base_url, m2.group(1))
+        # atob/decoded URL
+        atob_m = re.search(r"atob\(['\"]([A-Za-z0-9+/=]{20,})['\"]\)", st)
+        if atob_m:
+            try:
+                dec = base64.b64decode(atob_m.group(1) + "=" * (-len(atob_m.group(1)) % 4)).decode("utf-8", errors="ignore")
+                murl = re.search(r"(https?://[^\s'\"\\]+)", dec)
+                if murl:
+                    return murl.group(1)
+            except Exception:
+                pass
+
+    # 5) meta refresh tag
+    meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
+    if meta and meta.has_attr("content"):
+        m = re.search(r"url=(.+)", meta["content"], re.I)
+        if m:
+            return urljoin(base_url, m.group(1).strip())
+
+    return None
+
+
+def get_base_url(url: str) -> str:
+    """Return scheme://host from a full URL."""
+    try:
+        p = urlparse(url)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    except Exception:
+        pass
+    return ""
+
+def get_index_quality(text: Optional[str]) -> int:
+    """Extract quality like 1080p → 1080. Defaults to 2160."""
+    if not text:
+        return 2160
+    m = re.search(r"(\d{3,4})[pP]", text)
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            pass
+    return 2160
 
 
 def mediator_get_redirect_links(url: str) -> str:
     """
-    Defensive mediator resolver:
-    - Skip known-flaky hosts quickly.
-    - Try a couple lightweight attempts with slightly larger timeout.
-    - Decode multiple common pipelines: base64 x2, rot13, JSON with 'o' or 'data' fields.
-    - On any problem return empty string (caller will fall back).
+    Heuristic mediator resolver:
+      - Try to fetch page, look for base64 tokens, simple JS-embedded targets, meta-refreshs,
+        anchors/buttons with data-href/data-link, form actions, setTimeout(window.location...) patterns,
+        and follow those candidate targets up to a few hops.
+      - Skip known-flaky / ad hosts early.
+      - Return resolved final URL (hubcloud/hubdrive/pixeldrain/etc) or empty string if not resolvable.
     """
     try:
         parsed = urlparse(url)
@@ -443,38 +641,44 @@ def mediator_get_redirect_links(url: str) -> str:
             logger.info(f"[mediator] skipping mediator for host: {host}")
             return ""
 
-        last_text = ""
+        # conservative timeouts for mediator flow (some pages are slow)
         attempts = 2
+        page_text = ""
         for attempt in range(attempts):
             try:
-                resp = http_get(url, timeout=max(_DEFAULT_TIMEOUT, 5), max_retries=0)
-                last_text = resp.text or ""
+                resp = http_get(url, timeout=max(_DEFAULT_TIMEOUT, 8), max_retries=0)
+                page_text = resp.text or ""
                 break
             except Exception as e:
                 logger.warning(f"[mediator] GET attempt {attempt+1}/{attempts} failed for {url}: {e}")
                 if attempt + 1 < attempts:
-                    time.sleep(0.4 * (attempt + 1))
-        else:
-            logger.warning("[mediator] all GET attempts failed, returning empty")
+                    time.sleep(0.5 * (attempt + 1))
+        if not page_text:
+            logger.info("[mediator] no page text retrieved")
             return ""
 
-        # collect tokens from the mediator regex or long base64-like blocks
+        # quick scan: if page already contains direct hub links, return first obvious candidate
+        m_direct = re.search(r'(https?://[^\s"\']+(?:hubcloud|hubdrive|pixeldrain|pixeldrain.dev|drive|r2\.dev|10gbps|mega)[^\s"\']*)', page_text, re.I)
+        if m_direct:
+            candidate = m_direct.group(1)
+            logger.info(f"[mediator] quick direct candidate: {candidate}")
+            return candidate
+
+        # collect candidate tokens from known regex (same as Kotlin pattern used earlier)
         combined = []
-        for m in _MEDIATOR_REGEX.finditer(last_text):
+        for m in _MEDIATOR_REGEX.finditer(page_text):
             part = m.group(1) or m.group(2) or ""
             if part:
                 combined.append(part)
         combined_str = "".join(combined).strip()
 
+        # if no token, also look for large base64-ish blocks in scripts
         if not combined_str:
-            b64_cand = re.findall(r"([A-Za-z0-9+/]{40,}={0,2})", last_text)
+            b64_cand = re.findall(r"([A-Za-z0-9+/]{40,}={0,2})", page_text)
             if b64_cand:
                 combined_str = "".join(b64_cand[:2])
 
-        if not combined_str:
-            logger.info("[mediator] no token-like content found")
-            return ""
-
+        # decode pipeline helper
         def try_b64(s: str) -> str:
             try:
                 padded = s + "=" * (-len(s) % 4)
@@ -482,84 +686,169 @@ def mediator_get_redirect_links(url: str) -> str:
             except Exception:
                 return ""
 
-        try:
+        # 1) try decode-first pipelines
+        decoded = ""
+        if combined_str:
             step1 = try_b64(combined_str)
-            step2 = try_b64(step1) if step1 else ""
-            step3 = _rot13(step2) if step2 else ""
-            decoded = try_b64(step3) or try_b64(step1) or ""
-            if not decoded:
-                decoded = try_b64(_rot13(combined_str))
-        except Exception as e:
-            logger.warning(f"[mediator] decode pipeline exception: {e}")
-            return ""
-
-        if not decoded:
-            logger.info("[mediator] decoding produced no text")
-            return ""
-
-        obj = None
-        try:
-            obj = json.loads(decoded)
-        except Exception:
-            # try to extract JSON substring
-            mjson = re.search(r"(\{.+\})", decoded, re.S)
-            if mjson:
-                try:
-                    obj = json.loads(mjson.group(1))
-                except Exception:
-                    obj = None
-
-        if not isinstance(obj, dict):
-            logger.info("[mediator] decoded content not JSON object")
-            return ""
-
-        final_url = ""
-        try:
-            encoded_o = obj.get("o", "") or ""
-            if encoded_o:
-                final_url = try_b64(encoded_o).strip()
-        except Exception:
-            final_url = ""
-
-        data_raw = obj.get("data", "") or ""
-        data_decoded = ""
-        if data_raw:
+            if step1:
+                step2 = try_b64(step1)
+                step3 = _rot13(step2) if step2 else ""
+                decoded = try_b64(step3) or try_b64(step1) or ""
+                if not decoded:
+                    # sometimes rot13 then b64 works
+                    decoded = try_b64(_rot13(combined_str)) or ""
+        if decoded:
+            # if decoded JSON contains 'o' or 'data', attempt to extract/return useful URL
             try:
-                data_decoded = base64.b64decode(data_raw + "=" * (-len(data_raw) % 4)).decode("utf-8", errors="ignore").strip()
+                obj = json.loads(decoded)
+                encoded_o = obj.get("o", "") or ""
+                if encoded_o:
+                    final_o = try_b64(encoded_o).strip()
+                    if final_o:
+                        logger.info(f"[mediator] found encoded 'o' -> {final_o[:120]}")
+                        return final_o
+                # 'data' may require a separate request to blog_url
+                data_raw = obj.get("data", "") or ""
+                blog_url = obj.get("blog_url", "") or ""
+                if blog_url and data_raw:
+                    try:
+                        q = urlencode({"re": data_raw})
+                        # GET the blog_url + re=... — often returns final redirect as body
+                        r = http_get(blog_url + ("&" if "?" in blog_url else "?") + q, timeout=max(_DEFAULT_TIMEOUT, 8), max_retries=0)
+                        txt = (r.text or "").strip()
+                        if txt:
+                            logger.info(f"[mediator] blog_url returned candidate ({len(txt)} chars)")
+                            # try to extract hostful URL inside
+                            m = re.search(r'(https?://[^\s"\']+(?:hubcloud|hubdrive|pixeldrain|drive|mega|10gbps)[^\s"\']*)', txt, re.I)
+                            if m:
+                                return m.group(1)
+                            return txt
+                    except Exception as e:
+                        logger.warning(f"[mediator] blog_url fetch failed: {e}")
             except Exception:
-                data_decoded = ""
+                # not JSON — fall through to other heuristics
+                pass
 
-        blog_url = obj.get("blog_url", "") or ""
-        if not final_url and blog_url and data_decoded:
+        # 2) Look for meta-refresh / <noscript> redirects
+        m_meta = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]*content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', page_text, re.I)
+        if m_meta:
+            target = m_meta.group(1)
+            target = urljoin(url, target)
+            logger.info(f"[mediator] meta-refresh -> {target}")
+            return target
+
+        # 3) Look for simple JS patterns: setTimeout(function(){ location.href='...' }, 10000)
+        m_js1 = re.search(r"setTimeout\(\s*function\(\)\s*\{\s*(?:window\.location|location\.href|location\.assign)\s*=\s*['\"]([^'\"]+)['\"]", page_text, re.I)
+        if m_js1:
+            target = urljoin(url, m_js1.group(1))
+            logger.info(f"[mediator] found setTimeout location -> {target}")
+            return target
+
+        # 4) Look for direct JS assignments like window.location='...'
+        m_js2 = re.search(r"(?:window\.location|location\.href|location\.assign)\s*=\s*['\"]([^'\"]+)['\"]", page_text, re.I)
+        if m_js2:
+            target = urljoin(url, m_js2.group(1))
+            logger.info(f"[mediator] found js location -> {target}")
+            return target
+
+        # 5) Look for buttons/anchors that are disabled but contain data-href/data-link/data-url attributes
+        soup = BeautifulSoup(page_text, "html.parser")
+        # common patterns: <a id="continue" data-href="...">, <button data-link="...">, <a class="get-links" href="javascript:void(0)" data-url="...">
+        for sel in ("a[data-href]", "a[data-link]", "a[data-url]", "button[data-href]", "button[data-link]", "button[data-url]"):
+            for el in soup.select(sel):
+                cand = (el.get("data-href") or el.get("data-link") or el.get("data-url") or "").strip()
+                if cand:
+                    cand_full = urljoin(url, cand)
+                    logger.info(f"[mediator] found data-attr candidate -> {cand_full}")
+                    return cand_full
+
+        # 6) Look for inline onclick handlers that set location to a URL
+        for el in soup.find_all(attrs={"onclick": True}):
+            onclick = el.get("onclick") or ""
+            m_on = re.search(r"(?:window\.location|location\.href|location\.assign)\s*=\s*['\"]([^'\"]+)['\"]", onclick, re.I)
+            if m_on:
+                tgt = urljoin(url, m_on.group(1))
+                logger.info(f"[mediator] onclick candidate -> {tgt}")
+                return tgt
+
+        # 7) Look for forms with action that might post to a blog_url or endpoint which returns final link
+        for form in soup.find_all("form", action=True):
+            action = form.get("action") or ""
+            if action:
+                action_full = urljoin(url, action)
+                # if form contains hidden inputs 're' or 'data', try to post them (best-effort GET/POST)
+                inputs = {inp.get("name"): inp.get("value") for inp in form.find_all("input", attrs={"name": True})}
+                if inputs:
+                    try:
+                        if form.get("method","").lower() == "post":
+                            r = _SESSION.post(action_full, data=inputs, headers=headers, timeout=10)
+                        else:
+                            r = _SESSION.get(action_full, params=inputs, headers=headers, timeout=10)
+                        txt = r.text or ""
+                        m = re.search(r'(https?://[^\s"\']+(?:hubcloud|hubdrive|pixeldrain|drive|mega|10gbps)[^\s"\']*)', txt, re.I)
+                        if m:
+                            logger.info(f"[mediator] form action returned candidate -> {m.group(1)}")
+                            return m.group(1)
+                    except Exception as e:
+                        logger.warning(f"[mediator] form action fetch failed: {e}")
+
+        # 8) Fallback: follow reasonable non-ad anchors found on page (limit hops)
+        anchors = []
+        for a in soup.find_all("a", href=True):
+            h = a.get("href")
+            if not h:
+                continue
+            hfull = urljoin(url, h)
+            # skip anchors to same page or javascript anchors
+            if hfull.startswith("javascript:") or hfull == "#" or is_blocked_host(hfull):
+                continue
+            anchors.append(hfull)
+
+        # Try to follow anchors up to 3 hops, looking for hubcloud/hubdrive/pixeldrain/10gbps/mega
+        tried = set()
+        for a0 in anchors[:6]:  # limit breadth
+            if a0 in tried:
+                continue
+            tried.add(a0)
             try:
-                q = urlencode({"re": data_decoded})
-                blog_endpoint = blog_url + ("&" if "?" in blog_url else "?") + q
-                r = http_get(blog_endpoint, timeout=max(_DEFAULT_TIMEOUT, 5), max_retries=0)
-                final_url = r.text.strip()
+                r0 = http_get(a0, timeout=max(_DEFAULT_TIMEOUT, 6), max_retries=0)
+                t0 = r0.text or ""
+                # quick direct URL in response
+                m = re.search(r'(https?://[^\s"\']+(?:hubcloud|hubdrive|pixeldrain|drive|mega|10gbps)[^\s"\']*)', t0, re.I)
+                if m:
+                    logger.info(f"[mediator] anchor-follow found -> {m.group(1)}")
+                    return m.group(1)
+                # check meta refresh on this page
+                mmeta = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]*content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', t0, re.I)
+                if mmeta:
+                    tgt = urljoin(a0, mmeta.group(1))
+                    logger.info(f"[mediator] anchor-follow meta -> {tgt}")
+                    return tgt
             except Exception as e:
-                logger.warning(f"[mediator] blog_url fetch failed: {e}")
+                logger.warning(f"[mediator] anchor follow failed for {a0}: {e}")
 
-        final = (final_url or "").strip()
-        logger.info(f"[mediator] Resolved → {final[:120]}{'...' if len(final)>120 else ''}")
-        return final
+        logger.info("[mediator] resolution produced no final URL")
+        return ""
     except Exception as e:
         logger.warning(f"[mediator] unexpected failure: {e}")
         return ""
 
 
+
 def get_redirect_links(url: str) -> str:
     """
     Return resolved redirect URL string.
-    - Only call mediator for links containing 'id=' AND not blocked/quick-fail host.
-    - Otherwise return url as-is.
+    - We no longer skip allowlisted hosts; we attempt mediator resolution for allowlisted ones.
+    - Otherwise return url as-is (or empty string if resolution failed).
     """
     try:
-        if "id=" in url.lower():
-            parsed = urlparse(url)
-            host = (parsed.netloc or "").lower()
-            if not host or host in _MEDIATOR_QUICK_FAIL_HOSTS or is_blocked_host(url):
-                logger.info(f"[redirect] skipping mediator for {host}")
-                return url
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return url
+        # For performance: only attempt the interactive mediator for likely mediator links
+        low = url.lower()
+        if "id=" in low or "reurl=" in low or "hubcdn" in low or host in _RESOLVE_ALLOWLIST:
             resolved = mediator_get_redirect_links(url)
             return resolved or url
         return url
@@ -568,240 +857,323 @@ def get_redirect_links(url: str) -> str:
         return url
 
 # =====================================================================
-# 4KHDHub
+# 4KHDHub (Python port of the Kotlin FourKHDHub)
 # =====================================================================
 
+# TMDB helper constants (match Kotlin file constants)
+TMDBAPI = "https://wild-surf-4a0d.phisher1.workers.dev"
+TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+TMDBIMAGEBASEURL = "https://image.tmdb.org/t/p/original"
 
-def to_search_result(a: BeautifulSoup, base_url: str) -> Optional[Dict]:
-    h3 = a.select_one("h3")
-    if not h3:
-        return None
-    title = h3.get_text(strip=True)
-    href = a.get("href") or ""
-    if not href.startswith("http"):
-        href = urljoin(base_url, href)
-    img = a.select_one("img")
-    poster = img.get("src") if img else None
-    return {"title": title, "url": href, "poster": poster}
-
-
-def search_4k(query: str) -> List[Dict]:
-    q = quote_plus(query.strip())
-    url = f"{FOURK_MAIN}/?s={q}"
+# Utility: safe requests -> return text or None
+def _safe_get_text(url: str, timeout: int = _DEFAULT_TIMEOUT, referer: Optional[str] = None) -> Optional[str]:
     try:
-        resp = http_get(url, timeout=SEARCH_TIMEOUT, max_retries=0)
-        logger.info(f"[search_4k] url={url} status={resp.status_code} len={len(resp.text)}")
-        soup = BeautifulSoup(resp.text, "html.parser")
-        results = []
+        resp = http_get(url, referer=referer, timeout=timeout, max_retries=0)
+        return resp.text or ""
+    except Exception as e:
+        logger.warning(f"[safe_get] failed for {url}: {e}")
+        return None
 
+def fetchtmdb(title: str) -> Optional[int]:
+    """
+    Search TMDB for a title and return the best match id (or None).
+    Mirrors the Kotlin fetchtmdb behaviour: search/multi, compare lowercase name contains.
+    """
+    try:
+        url = f"{TMDBAPI}/search/multi?api_key={TMDB_API_KEY}&query={urlquote(title)}"
+        text = _safe_get_text(url, timeout=5)
+        if not text:
+            return None
+        root = json.loads(text)
+        results = root.get("results") or []
+        tnorm = title.lower().replace("-", " ").strip()
+        for obj in results:
+            name = (obj.get("name") or obj.get("title") or obj.get("original_name") or obj.get("original_title") or "").lower().replace("-", " ")
+            if not name:
+                continue
+            if tnorm in name:
+                return obj.get("id")
+    except Exception as e:
+        logger.warning(f"[fetchtmdb] failed: {e}")
+    return None
+
+
+def _element_to_search_result(a: BeautifulSoup, base_url: str) -> Optional[Dict]:
+    """
+    Convert a single <a> card into search response dict (title, url, poster, tags, quality).
+    """
+    try:
+        h3 = a.select_one("h3")
+        if not h3:
+            return None
+        title = h3.get_text(strip=True)
+        href = a.get("href") or ""
+        if not href.startswith("http"):
+            href = urljoin(base_url, href)
+        img = a.select_one("img")
+        poster = img.get("src") if img and img.has_attr("src") else None
+        tags = [s.get_text(strip=True) for s in a.select("span.movie-card-format")]
+        return {"title": title, "url": href, "poster": poster, "tags": tags}
+    except Exception as e:
+        logger.warning(f"[to_search_result] parse failed: {e}")
+        return None
+
+
+def search_4k(query: str, max_pages: int = 1) -> List[Dict]:
+    """
+    Search 4KHDHub for a query. Returns list of dicts with keys:
+    { title, url, poster, tags }
+    """
+    results: List[Dict] = []
+    try:
+        q = quote_plus(query.strip())
+        base = FOURK_MAIN or DEFAULT_4KHDHUB
+        url = f"{base}/?s={q}"
+        logger.info(f"[search_4k] GET {url}")
+        text = _safe_get_text(url, timeout=SEARCH_TIMEOUT)
+        if not text:
+            return results
+        soup = BeautifulSoup(text, "html.parser")
         for a in soup.select("div.card-grid a"):
-            r = to_search_result(a, FOURK_MAIN)
+            r = _element_to_search_result(a, base)
             if r:
                 results.append(r)
-
         if not results:
             for a in soup.find_all("a", href=True):
                 img = a.find("img")
                 if not img:
                     continue
                 title = img.get("alt") or img.get("title") or a.get_text(strip=True)
-                if not title:
-                    continue
                 href = a["href"]
-                if not href:
-                    continue
                 if not href.startswith("http"):
-                    href = urljoin(FOURK_MAIN, href)
-                results.append({"title": title, "url": href, "poster": img.get("src")})
-
-        return results
+                    href = urljoin(base, href)
+                results.append({"title": title, "url": href, "poster": img.get("src"), "tags": []})
     except Exception as e:
         logger.error(f"[search_4k] failed: {e}")
-        return []
+    return results
 
 
 def load_4k(url: str) -> Dict:
+    """
+    Load a 4khdhub page and produce a dictionary similar to the Kotlin `load` result.
+    """
+    out = {}
     try:
-        soup = BeautifulSoup(http_get(url, timeout=_DEFAULT_TIMEOUT).text, "html.parser")
-    except Exception as e:
-        logger.error(f"[load_4k] GET failed: {e}")
-        return {}
+        text = _safe_get_text(url, timeout=_DEFAULT_TIMEOUT)
+        if not text:
+            return {}
+        soup = BeautifulSoup(text, "html.parser")
+        title = (soup.select_one("h1.page-title").get_text(strip=True).split("(")[0].strip()) if soup.select_one("h1.page-title") else ""
+        poster = ""
+        og = soup.select_one("meta[property='og:image']")
+        if og and og.has_attr("content"):
+            poster = og["content"]
+        tags = [span.get_text(strip=True) for span in soup.select("div.mt-2 span.badge")]
+        year = None
+        for span in soup.select("div.mt-2 span"):
+            t = span.get_text(strip=True)
+            if re.match(r"^(19|20)\d{2}$", t):
+                year = int(t)
+                break
+        tv_type = "Movie" if "Movies" in tags else "TvSeries"
+        description = (soup.select_one("div.content-section p.mt-4").get_text(strip=True)) if soup.select_one("div.content-section p.mt-4") else None
 
-    title_elem = soup.select_one("h1.page-title")
-    title = (title_elem.get_text(strip=True) if title_elem else "").split("(")[0].strip()
+        tmdb_id = None
+        try:
+            tmdb_id = fetchtmdb(title)
+        except Exception:
+            tmdb_id = None
 
-    poster = ""
-    og = soup.select_one("meta[property='og:image']")
-    if og and og.has_attr("content"):
-        poster = og["content"]
-
-    tags = [span.get_text(strip=True) for span in soup.select("div.mt-2 span.badge")]
-    year = None
-    for span in soup.select("div.mt-2 span"):
-        text = span.get_text(strip=True)
-        if re.match(r"^(19|20)\d{2}$", text):
-            year = int(text)
-            break
-
-    tv_type = "Movie" if "Movies" in tags else "TvSeries"
-
-    description = None
-    desc = soup.select_one("div.content-section p.mt-4")
-    if desc:
-        description = desc.get_text(strip=True)
-
-    if tv_type == "TvSeries":
-        episode_variants = defaultdict(lambda: defaultdict(list))
-        for season_elem in soup.select("div.episodes-list div.season-item"):
-            season_text = season_elem.select_one("div.episode-number")
-            season_text = season_text.get_text(strip=True) if season_text else ""
-            m_season = re.search(r"S?([1-9][0-9]*)", season_text)
-            if not m_season:
-                continue
-            season = int(m_season.group(1))
-
-            for ep_item in season_elem.select("div.episode-download-item"):
-                ep_text = ep_item.select_one("div.episode-file-info span.badge-psa")
-                ep_text = ep_text.get_text(strip=True) if ep_text else ""
-                m_ep = re.search(r"Episode-0*([1-9][0-9]*)", ep_text)
-                if not m_ep:
+        if tv_type == "TvSeries":
+            episode_variants = defaultdict(lambda: defaultdict(list))
+            for season_elem in soup.select("div.episodes-list div.season-item"):
+                season_text = season_elem.select_one("div.episode-number")
+                season_text = season_text.get_text(strip=True) if season_text else ""
+                m_season = re.search(r"S?([1-9][0-9]*)", season_text)
+                if not m_season:
                     continue
-                episode = int(m_ep.group(1))
+                season = int(m_season.group(1))
 
-                hrefs = [a.get("href") for a in ep_item.select("a") if a.get("href")]
-                size_elem = ep_item.select_one("div.episode-file-info span.badge-danger")
-                size_text = size_elem.get_text(strip=True) if size_elem else None
-                if not size_text:
-                    size_match = re.search(r"(\d+(?:\.\d+)?\s*[GM]B)", ep_item.get_text())
-                    size_text = size_match.group(1) if size_match else "Unknown"
+                for ep_item in season_elem.select("div.episode-download-item"):
+                    ep_text = ep_item.select_one("div.episode-file-info span.badge-psa")
+                    ep_text = ep_text.get_text(strip=True) if ep_text else ""
+                    m_ep = re.search(r"Episode-0*([1-9][0-9]*)", ep_text)
+                    if not m_ep:
+                        continue
+                    episode = int(m_ep.group(1))
+
+                    hrefs = [a.get("href") for a in ep_item.select("a") if a.get("href")]
+                    size_elem = ep_item.select_one("div.episode-file-info span.badge-danger")
+                    size_text = size_elem.get_text(strip=True) if size_elem else None
+                    if not size_text:
+                        size_match = re.search(r"(\d+(?:\.\d+)?\s*[GM]B)", ep_item.get_text() or "")
+                        size_text = size_match.group(1) if size_match else "Unknown"
+                    size_num = parse_size_to_gb(size_text)
+
+                    strings = list(ep_item.stripped_strings)
+                    filename_candidates = [s for s in strings if re.search(r"\.(mkv|mp4)$", s, re.I) and len(s) > 20]
+                    file_title = filename_candidates[0] if filename_candidates else ep_text
+                    file_title = re.sub(r"\[[^]]*\]", "", file_title)
+                    file_title = re.sub(r"\(.+?\)", "", file_title)
+
+                    m_q = re.search(r"(\d{3,4})[pP]", file_title)
+                    quality = int(m_q.group(1)) if m_q else 0
+
+                    episode_variants[season][episode].append({
+                        "quality": quality,
+                        "size": size_num,
+                        "links": hrefs,
+                        "filename": file_title
+                    })
+
+            out = {
+                "type": "TvSeries",
+                "title": title,
+                "url": url,
+                "episodes": {
+                    int(s): {int(e): v for e, v in eps.items()}
+                    for s, eps in episode_variants.items()
+                },
+                "poster": poster,
+                "year": year,
+                "plot": description,
+                "tags": tags,
+                "tmdb_id": tmdb_id
+            }
+        else:
+            variants = []
+            for item in soup.select("div.download-item"):
+                header_text = item.select_one("div.flex-1.text-left.font-semibold")
+                header_text = header_text.get_text(strip=True) if header_text else ""
+                m_sz = re.search(r"(\d+(?:\.\d+)?\s*GB)", header_text)
+                size_text = m_sz.group(1) if m_sz else "Unknown"
                 size_num = parse_size_to_gb(size_text)
-
-                strings = list(ep_item.stripped_strings)
-                filename_candidates = [
-                    s for s in strings
-                    if re.search(r"\.(mkv|mp4)$", s, re.I) and len(s) > 20
-                ]
-                file_title = filename_candidates[0] if filename_candidates else ep_text
+                m_q = re.search(r"(\d{3,4})[pP]", header_text)
+                quality = int(m_q.group(1)) if m_q else 0
+                hrefs = [a.get("href") for a in item.select("a") if a.get("href")]
+                file_title_elem = item.select_one("div.file-title")
+                file_title = file_title_elem.get_text(strip=True) if file_title_elem else ""
                 file_title = re.sub(r"\[[^]]*\]", "", file_title)
                 file_title = re.sub(r"\(.+?\)", "", file_title)
-
-                m_q = re.search(r"(\d{3,4})[pP]", file_title)
-                quality = int(m_q.group(1)) if m_q else 0
-
-                episode_variants[season][episode].append({
+                variants.append({
                     "quality": quality,
                     "size": size_num,
                     "links": hrefs,
                     "filename": file_title
                 })
 
-        return {
-            "type": "TvSeries",
-            "title": title,
-            "url": url,
-            "episodes": {
-                int(s): {int(e): v for e, v in eps.items()}
-                for s, eps in episode_variants.items()
-            },
-            "poster": poster,
-            "year": year,
-            "plot": description,
-            "tags": tags
-        }
-    else:
-        variants = []
-        for item in soup.select("div.download-item"):
-            header_text = item.select_one("div.flex-1.text-left.font-semibold")
-            header_text = header_text.get_text(strip=True) if header_text else ""
-            m_sz = re.search(r"(\d+(?:\.\d+)?\s*GB)", header_text)
-            size_text = m_sz.group(1) if m_sz else "Unknown"
-            size_num = parse_size_to_gb(size_text)
-            m_q = re.search(r"(\d{3,4})[pP]", header_text)
-            quality = int(m_q.group(1)) if m_q else 0
-            hrefs = [a.get("href") for a in item.select("a") if a.get("href")]
-            file_title_elem = item.select_one("div.file-title")
-            file_title = file_title_elem.get_text(strip=True) if file_title_elem else ""
-            file_title = re.sub(r"\[[^]]*\]", "", file_title)
-            file_title = re.sub(r"\(.+?\)", "", file_title)
-            variants.append({
-                "quality": quality,
-                "size": size_num,
-                "links": hrefs,
-                "filename": file_title
-            })
+            out = {
+                "type": "Movie",
+                "title": title,
+                "url": url,
+                "variants": variants,
+                "poster": poster,
+                "year": year,
+                "plot": description,
+                "tags": tags,
+                "tmdb_id": tmdb_id
+            }
 
-        return {
-            "type": "Movie",
-            "title": title,
-            "url": url,
-            "variants": variants,
-            "poster": poster,
-            "year": year,
-            "plot": description,
-            "tags": tags
-        }
-
-# =====================================================================
-# Link helpers
-# =====================================================================
-
-
-def get_redirect_links(url: str) -> str:
-    try:
-        if "id=" in url.lower():
-            return mediator_get_redirect_links(url)
-        return url
     except Exception as e:
-        logger.warning(f"[redirect] failed for {url}: {e}")
-        return ""
+        logger.error(f"[load_4k] failed to parse {url}: {e}", exc_info=True)
+        return {}
+    return out
 
 
-def collect_links_from_variant(links_list: List[str], source_quality: int = 0) -> List[Dict]:
+# loadLinks helper: mirrors Kotlin loadLinks in behaviour (extracts URLs, resolves mediator id links, dispatches to extractors)
+def load_links_from_4khdhub_page(data: str, subtitle_callback, extractor_callback) -> bool:
     """
-    FAST version:
-
-    - Do NOT resolve redirects/mediator here.
-    - Just extract clean-looking URLs and carry quality.
-    - Actual heavy resolution is done in /api/extract.
+    Input: raw page content or url-containing string (data).
+    Behaviour:
+      - Find http(s) links using regex.
+      - For each, if it contains id= (mediator), resolve via get_redirect_links()
+      - Then attempt to route to Hubdrive/HubCloud extractors by matching host substrings.
+      - If no specialized extractor matches, attempt to hand off to generic loadExtractor.
+    Returns True when completed (always returns True like Kotlin).
     """
-    results = []
-    for link_str in links_list:
-        urls = re.findall(r'https?://[^\s\'",()\[\]]+', link_str) or [link_str]
-        for u in urls:
-            u = u.strip()
-            if not is_valid_url(u):
-                continue
-            results.append({
-                "name": "Unknown",
-                "url": u,
-                "quality": source_quality
-            })
-    return results
-
-
-def _extract_link_param(u: str) -> Optional[str]:
     try:
-        parsed = urlparse(u)
-        qs = parse_qs(parsed.query)
-        if "link" in qs and qs["link"]:
-            return unquote(qs["link"][0])
-        m = re.search(r"[?&]link=([^&]+)", u)
-        if m:
-            return unquote(m.group(1))
-    except Exception:
-        pass
-    return None
+        LINK_REGEX = re.compile(r"https?://[^\s'\",()\[\]]+")
+        links = list({m.group(0) for m in LINK_REGEX.finditer(data)})
+        for rawLink in links:
+            try:
+                needs_redirect = "id=" in rawLink.lower()
+                resolved = rawLink
+                if needs_redirect:
+                    try:
+                        resolved_candidate = get_redirect_links(rawLink)
+                        if resolved_candidate:
+                            resolved = resolved_candidate
+                    except Exception as e:
+                        logger.warning(f"[4k.load_links] mediator resolution failed for {rawLink}: {e}")
+                        resolved = rawLink
 
+                logger.info(f"[4k.load_links] resolved => {resolved}")
 
-def get_base_url(url: str) -> str:
-    try:
-        u = urlparse(url)
-        return f"{u.scheme}://{u.netloc}"
-    except Exception:
-        return ""
+                low = (resolved or "").lower()
+                matched = False
+
+                if "hubdrive" in low:
+                    try:
+                        hd = hubdrive_extract(resolved)
+                        for item in hd:
+                            final_url = item.get("url")
+                            if final_url:
+                                if "hubcloud" in final_url.lower():
+                                    try:
+                                        hc = hubcloud_extract(final_url)
+                                        for e in hc:
+                                            extractor_callback({
+                                                "server": e.get("server"),
+                                                "url": e.get("url"),
+                                                "quality": e.get("quality"),
+                                                "label": e.get("label")
+                                            })
+                                    except Exception as e:
+                                        logger.warning(f"[4k.load_links] hubcloud_extract failed for {final_url}: {e}")
+                                else:
+                                    extractor_callback({
+                                        "server": "HubDrive",
+                                        "url": final_url,
+                                        "quality": item.get("quality"),
+                                        "label": item.get("label")
+                                    })
+                        matched = True
+                    except Exception as e:
+                        logger.warning(f"[4k.load_links] hubdrive handling failed: {e}")
+
+                elif "hubcloud" in low:
+                    try:
+                        hc = hubcloud_extract(resolved)
+                        for e in hc:
+                            extractor_callback({
+                                "server": e.get("server"),
+                                "url": e.get("url"),
+                                "quality": e.get("quality"),
+                                "label": e.get("label")
+                            })
+                        matched = True
+                    except Exception as e:
+                        logger.warning(f"[4k.load_links] hubcloud direct failed: {e}")
+
+                if not matched:
+                    extractor_callback({
+                        "server": "Other",
+                        "url": resolved,
+                        "quality": None,
+                        "label": None
+                    })
+
+            except Exception as e:
+                logger.error(f"[4k.load_links] unexpected error for {rawLink}: {e}")
+
+    except Exception as e:
+        logger.error(f"[4k.load_links] failed: {e}")
+        return False
+
+    return True
 
 # =====================================================================
-# HubDrive / HubCloud (improved parity with Kotlin)
+# HubDrive / HubCloud (as earlier in your code)
 # =====================================================================
 
 
@@ -1561,7 +1933,6 @@ async def request_exception_handler(request, exc):
         }
     )
 
-
 # =====================================================================
 # ChromeOs (cache, cinemaos, helper functions)
 # =====================================================================
@@ -1648,12 +2019,9 @@ def cinemaos_generate_hash(
       final = HMAC-SHA256(first, secondary)
       return final (hex)
     """
-    # Build content using tmdb/imdb/season/episode (Kotlin uses only present parts)
-    # Note: callers may pass empty strings for season/episode when not present
     content = _create_cinemaos_content_string(tmdb_id, "", season_id, episode_id) \
         if (tmdb_id and (season_id or episode_id)) else _create_cinemaos_content_string(tmdb_id, "", season_id, episode_id)
 
-    # Primary/secondary keys are hex-like constant strings from Kotlin implementation
     primary_bytes = _CINEMAOS_PRIMARY_KEY.encode("utf-8")
     secondary_bytes = _CINEMAOS_SECONDARY_KEY.encode("utf-8")
 
@@ -1703,12 +2071,10 @@ def cinemaos_decrypt_response(data_obj: Any) -> str:
     if data_obj is None:
         raise ValueError("no data to decrypt")
 
-    # If it's a JSON string, try to parse
     if isinstance(data_obj, str):
         try:
             data_obj = json.loads(data_obj)
         except Exception:
-            # keep as-is and let next validation fail with clear message
             pass
 
     if not isinstance(data_obj, dict):
@@ -1730,27 +2096,17 @@ def cinemaos_decrypt_response(data_obj: Any) -> str:
     except Exception as e:
         raise ValueError(f"hex parsing failed: {e}")
 
-    # Match Kotlin's password literal — they used a long hex-like literal and then constructed a PBEKeySpec from its bytes->chars.
-    # The simplest compatible approach is to use the same string decoded to bytes and also provide the same bytes when deriving.
     password_literal = (
         "a1b2c3d4e4f6477658455678901477567890abcdef1234567890abcdef123456"
     )
 
-    # Kotlin converted key bytes to chars in PBEKeySpec by mapping each byte to a Java char.
-    # We'll mimic that by constructing a 'char string' where each character has codepoint equal to the byte value,
-    # then encode to UTF-8 to obtain bytes for PBKDF2's password input. PBKDF2HMAC accepts a bytes-like password.
     try:
         key_bytes_raw = password_literal.encode("utf-8")
-        # mimic Java's bytes->char[] -> effectively produce a string of chars with codepoint == raw byte value
-        # Then encode that string using latin-1 to preserve single-byte values 0..255 as bytes 0..255.
-        # This approximates the Java char->bytes behaviour for 0..255 values.
         password_pseudo_chars = ''.join(chr(b) for b in key_bytes_raw)
         password_for_pbkdf2 = password_pseudo_chars.encode("latin-1")
     except Exception:
-        # fallback to simple utf-8 if unusual
         password_for_pbkdf2 = password_literal.encode("utf-8")
 
-    # Derive key using PBKDF2-HMAC-SHA256, 100000 iterations, 32 bytes (256 bits)
     try:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
@@ -1762,7 +2118,6 @@ def cinemaos_decrypt_response(data_obj: Any) -> str:
     except Exception as e:
         raise RuntimeError(f"pbkdf2 derive failed: {e}")
 
-    # AES-GCM decrypt: combine ciphertext + auth_tag as Kotlin does (cipher.doFinal(encrypted + tag))
     aesgcm = AESGCM(key)
     combined = cipher_bytes + auth_tag
     try:
@@ -1880,7 +2235,6 @@ def infer_quality_from_fields(quality_str: str, bitrate_str: str) -> int:
     q = (quality_str or "").strip().lower()
     b = (bitrate_str or "").strip().lower()
 
-    # direct numeric
     if q.isdigit():
         return int(q)
 
@@ -1900,22 +2254,79 @@ def infer_quality_from_fields(quality_str: str, bitrate_str: str) -> int:
             return 360
         return None
 
-    # first try quality field
     qv = from_text(q)
     if qv is not None:
         return qv
 
-    # then try bitrate hints
     bv = from_text(b)
     if bv is not None:
         return bv
 
-    # default if nothing matched
     return 1080
 
 
 def clean_name(s: str) -> str:
     return _CLEAN_RE.sub(" ", s).strip()
+
+
+def collect_links_from_variant(links: List[str], quality: Optional[int]) -> List[Dict[str, Any]]:
+    """
+    Given a list of variant hrefs (from a 4khdhub 'links' entry), resolve them into final
+    hubdrive/hubcloud/pixeldrain/etc candidate URLs.
+
+    Returns a list of dicts: [{"url": resolved_url, "quality": quality}, ...]
+    """
+    out: List[Dict[str, Any]] = []
+    if not links:
+        return out
+
+    for raw in links:
+        try:
+            if not raw:
+                continue
+            raw = raw.strip()
+            # Normalize protocol-relative
+            if raw.startswith("//"):
+                raw = "https:" + raw
+            # If relative path, try to make absolute (best-effort) - we lack base here so leave as-is
+            # Resolve mediator-style redirects (id=...) where present
+            resolved = raw
+            if "id=" in raw.lower() or "reurl=" in raw.lower():
+                try:
+                    rr = get_redirect_links(raw)
+                    if rr:
+                        resolved = rr
+                except Exception as e:
+                    logger.warning(f"[collect_links] mediator resolution failed for {raw}: {e}")
+                    # fallback to raw
+
+            # ignore obviously blocked/ad hosts
+            if is_blocked_host(resolved):
+                logger.info(f"[collect_links] skipping blocked/ad host: {resolved}")
+                continue
+
+            # If resolved is an anchor like javascript:... skip
+            if resolved.lower().startswith("javascript:") or resolved.lower().startswith("data:"):
+                continue
+
+            out.append({"url": resolved, "quality": quality})
+        except Exception as e:
+            logger.warning(f"[collect_links] unexpected error resolving {raw}: {e}")
+
+    # Deduplicate while preserving order
+    seen = set()
+    final: List[Dict[str, Any]] = []
+    for item in out:
+        u = item.get("url") or ""
+        if not u:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        final.append(item)
+
+    return final
+
 
 
 def make_cache_key(
@@ -1925,11 +2336,10 @@ def make_cache_key(
     title: Optional[str],
     year: Optional[int],
     imdb_id: Optional[str],
+    version: str = "v1",
 ) -> str:
-    """
-    Deterministic cache key for a specific request.
-    """
     payload = {
+        "version": version,
         "tmdb_id": tmdb_id,
         "season": season,
         "episode": episode,
@@ -1961,10 +2371,472 @@ def cache_put(key: str, data: Dict[str, Any]) -> None:
     """
     now = time.time()
     if len(cinemaos_cache) >= CACHE_MAX_ENTRIES:
-        # Drop oldest-ish item (not perfect LRU, but good enough)
         oldest_key = min(cinemaos_cache.items(), key=lambda kv: kv[1][0])[0]
         cinemaos_cache.pop(oldest_key, None)
     cinemaos_cache[key] = (now, data)
+    
+# =====================================================================
+# Watch32 API
+# =====================================================================
+
+def watch32_http_get(url: str, headers=None) -> requests.Response:
+    r = SESSION.get(url, headers=headers, timeout=20)
+    if r.status_code != 200:
+        raise HTTPException(500, f"HTTP {r.status_code} -> {url}")
+    return r
+
+def soup(url: str) -> BeautifulSoup:
+    return BeautifulSoup(watch32_http_get(url).text, "html.parser")
+
+# =========================================================
+# WATCH32 LOGIC (TITLE BASED)
+# =========================================================
+
+def watch32_search(title: str) -> Optional[str]:
+    s = soup(f"{WATCH32}/search/{title.replace(' ', '-')}")
+    item = s.select_one("div.flw-item h2.film-name a")
+    if not item:
+        return None
+
+    href = item["href"]
+    if href.startswith("http"):
+        return href
+
+    return WATCH32 + href
+
+
+
+def watch32_load(url: str) -> Dict:
+    s = soup(url)
+    cid = s.select_one("div.detail_page-watch")["data-id"]
+
+    if "movie" in url:
+        return {
+            "type": "movie",
+            "data": f"list/{cid}"
+        }
+
+    episodes = []
+    seasons = soup(f"{WATCH32}/ajax/season/list/{cid}").select("a.ss-item")
+
+    for ss in seasons:
+        sid = ss["data-id"]
+        season_num = int(ss.text.replace("Season", "").strip())
+        eps = soup(f"{WATCH32}/ajax/season/episodes/{sid}").select("a.eps-item")
+
+        for e in eps:
+            m = re.search(r"Eps (\d+):", e["title"])
+            if not m:
+                continue
+            episodes.append({
+                "season": season_num,
+                "episode": int(m.group(1)),
+                "data": f"servers/{e['data-id']}"
+            })
+
+    return {
+        "type": "tv",
+        "episodes": episodes
+    }
+    
+
+def watch32_links(data: str) -> List[str]:
+    s = soup(f"{WATCH32}/ajax/episode/{data}")
+    links = []
+
+    for a in s.select("a.link-item"):
+        lid = a.get("data-linkid") or a.get("data-id")
+        js = http_get(f"{WATCH32}/ajax/episode/sources/{lid}").json()
+        links.append(js["link"])
+
+    # IMPORTANT: pick LAST embed (best quality on Watch32)
+    return links[-1:] if links else []
+
+
+
+
+# =========================================================
+# VIDEOSTR EXTRACTOR
+# =========================================================
+
+def extract_nonce(text: str) -> Optional[str]:
+    m1 = re.search(r"\b[a-zA-Z0-9]{48}\b", text)
+    if m1:
+        return m1.group(0)
+
+    m2 = re.search(
+        r"\b([a-zA-Z0-9]{16})\b.*?\b([a-zA-Z0-9]{16})\b.*?\b([a-zA-Z0-9]{16})\b",
+        text
+    )
+    if m2:
+        return m2.group(1) + m2.group(2) + m2.group(3)
+
+    return None
+
+
+def parse_m3u8_variants(master_url: str) -> List[Dict]:
+    text = http_get(master_url).text
+    lines = text.splitlines()
+
+    variants = []
+    last = None
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            last = line
+            continue
+
+        if last and not line.startswith("#"):
+            res = re.search(r"RESOLUTION=(\d+x\d+)", last)
+            quality = int(res.group(1).split("x")[1]) if res else 0
+
+            variants.append({
+                "quality": quality,
+                "url": urljoin(master_url, line)
+            })
+            last = None
+
+    return sorted(variants, key=lambda x: x["quality"], reverse=True)
+
+
+import time
+
+def extract_videostr(url: str) -> List[Dict]:
+    vid = url.split("/")[-1].split("?")[0]
+    embed = f"{VIDEOSTR}/embed-1/v3/e-1/{vid}"
+
+    last_error = None
+
+    for attempt in range(3):  # retry loop
+        try:
+            # 1. Fetch embed
+            html = http_get(embed, headers=VIDEOSTR_HEADERS).text
+            nonce = extract_nonce(html)
+            if not nonce:
+                raise Exception("Nonce missing")
+
+            # 2. Fetch sources
+            api = f"{VIDEOSTR}/embed-1/v3/e-1/getSources?id={vid}&_k={nonce}"
+            resp = SESSION.get(api, headers=VIDEOSTR_HEADERS, timeout=20)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                src = data["sources"][0]["file"]
+
+                if ".m3u8" not in src:
+                    raise Exception("Expected m3u8")
+
+                return parse_m3u8_variants(src)
+
+            # 502 / 503 / 504 → retry
+            last_error = f"HTTP {resp.status_code}"
+            time.sleep(0.7)
+
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(0.7)
+
+    # after retries
+    raise HTTPException(
+        502,
+        f"Videostr backend unstable (last error: {last_error})"
+    )
+
+
+def get_watch32_sources(
+    title: str,
+    season: Optional[int],
+    episode: Optional[int],
+) -> list[dict]:
+    watch_url = watch32_search(title)
+    if not watch_url:
+        return []
+
+    content = watch32_load(watch_url)
+
+    if content["type"] == "movie":
+        server_data = content["data"]
+    else:
+        if season is None or episode is None:
+            return []
+        server_data = next(
+            (
+                e["data"]
+                for e in content["episodes"]
+                if e["season"] == season and e["episode"] == episode
+            ),
+            None,
+        )
+        if not server_data:
+            return []
+
+    sources = []
+    links = watch32_links(server_data)  # already LAST embed only
+
+    for link in links:
+        if "videostr" not in link:
+            continue
+
+        streams = extract_videostr(link)  # returns quality-separated m3u8s
+
+        for s in streams:
+            q = s["quality"]
+            sources.append(
+                {
+                    "name": f"Watch32 [Videostr] {q}p",
+                    "label": f"Watch32 [Videostr] {q}p",
+                    "url": s["url"],
+                    "type": "m3u8",
+                    "quality": q,
+                    "headers": {
+                        "Referer": "https://cinemaos.tech"
+                    },
+                }
+            )
+
+    return sources
+
+# =========================================================
+# worldforufree EXTRACTOR
+# =========================================================
+
+QUALITY_RE = re.compile(r"(4k|2160p|1080p|720p|480p)", re.I)
+
+
+# ===================== CORE SCRAPER LOGIC (UNCHANGED) =====================
+
+def get_first_movie_url(movie_name: str) -> str | None:
+    search_url = f"{BASE_URL}/?s={quote_plus(movie_name)}"
+    print(f"[search] {search_url}")
+
+    with httpx.Client(timeout=10, headers=HEADERS, follow_redirects=True) as c:
+        r = c.get(search_url)
+        print(f"[search] status {r.status_code}")
+        if r.status_code != 200:
+            return None
+
+    soup = BeautifulSoup(r.text, "lxml")
+
+    a = soup.select_one("section.home-wrapper figure figcaption a")
+    if not a:
+        print("[search] no thumbnail result found")
+        return None
+
+    print(f"[search] movie page: {a['href']}")
+    return a["href"]
+
+
+
+def extract_multi_link_1(movie_page_url: str) -> dict[str, str]:
+    print(f"\n[movie] {movie_page_url}")
+
+    with httpx.Client(timeout=10, headers=HEADERS, follow_redirects=True) as c:
+        r = c.get(movie_page_url)
+        print(f"[movie] status {r.status_code}")
+        r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "lxml")
+    results = {}
+
+    for a in soup.select("a.buttn.direct"):
+        text = " ".join(a.get_text().split()).lower()
+        href = a.get("href")
+
+        print(f"[movie] button: {text}")
+
+        if "multi link 1" not in text:
+            continue
+
+        q = QUALITY_RE.search(text)
+        if not q:
+            print("[movie] quality not detected")
+            continue
+
+        quality = q.group(1).upper()
+        results[quality] = href
+        print(f"[movie] accepted {quality} → {href}")
+
+    return results
+
+
+
+def extract_voe_from_uptobhai(uptobhai_url: str) -> str | None:
+    print(f"\n[uptobhai] {uptobhai_url}")
+
+    with httpx.Client(timeout=15, headers=HEADERS, follow_redirects=True) as c:
+        r1 = c.get(uptobhai_url)
+        print(f"[uptobhai] page status {r1.status_code}")
+        r1.raise_for_status()
+
+        # simulate button submit
+        r2 = c.post(uptobhai_url, data={})
+        print(f"[uptobhai] after click status {r2.status_code}")
+        r2.raise_for_status()
+
+    soup = BeautifulSoup(r2.text, "lxml")
+
+    for a in soup.select("div.view-well a[href]"):
+        href = a["href"]
+        if "voe.sx" in href:
+            print(f"[uptobhai] voe found {href}")
+            return href
+
+    print("[uptobhai] voe NOT found")
+    return None
+
+
+
+def extract_voe_code(voe_url: str) -> str | None:
+    print(f"\n[voe] parsing voe url: {voe_url}")
+
+    if not voe_url:
+        print("[voe] empty url")
+        return None
+
+    if not voe_url.startswith(("http://", "https://")):
+        voe_url = "https://" + voe_url
+
+    parsed = urlparse(voe_url)
+    parts = [p for p in parsed.path.split("/") if p]
+
+    if not parts:
+        print("[voe] invalid path")
+        return None
+
+    if parts[-1] == "download" and len(parts) >= 2:
+        code = parts[-2]
+    elif len(parts) >= 2 and parts[-2] == "e":
+        code = parts[-1]
+    else:
+        code = parts[-1]
+
+    print(f"[voe] extracted code: {code}")
+    return code
+
+
+async def extract_m3u8_from_voe(page, voe_url: str) -> str | None:
+    found = asyncio.Event()
+    result = None
+
+    async def on_response(response):
+        nonlocal result
+        url = response.url
+
+        if "jwplayer" in url and "mu=" in url:
+            clean = html.unescape(url)
+            parsed = urlparse(clean)
+            qs = parse_qs(parsed.query)
+            if "mu" in qs:
+                result = unquote(qs["mu"][0])
+                found.set()
+
+        elif "master.m3u8" in url:
+            result = url
+            found.set()
+
+    page.on("response", on_response)
+
+    await page.goto(voe_url, wait_until="domcontentloaded")
+    await page.wait_for_timeout(3000)
+
+    await page.evaluate("""
+        () => {
+            if (window.jwplayer) {
+                try {
+                    const p = jwplayer();
+                    p.setMute(true);
+                    p.play();
+                } catch {}
+            }
+            document.body.dispatchEvent(
+                new MouseEvent('mousedown', { bubbles: true })
+            );
+        }
+    """)
+
+    try:
+        await asyncio.wait_for(found.wait(), timeout=15)
+    except asyncio.TimeoutError:
+        pass
+
+    return result
+
+# =====================================================================
+# World4uFree – NEW IMPLEMENTATION (VOE → M3U8, Playwright-based)
+# =====================================================================
+
+async def get_world4ufree_sources(title: str) -> list[dict]:
+    movie_url = get_first_movie_url(title)
+    if not movie_url:
+        return []
+
+    quality_links = extract_multi_link_1(movie_url)
+    if not quality_links:
+        return []
+
+    voe_links: dict[str, str] = {}
+
+    # step 1: uptobhai → voe
+    for quality, link in quality_links.items():
+        voe = extract_voe_from_uptobhai(link)
+        if voe:
+            voe_links[quality] = voe
+
+    if not voe_links:
+        return []
+
+    results = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        context = await browser.new_context(
+            user_agent=HEADERS["User-Agent"]
+        )
+
+        for quality, voe_url in voe_links.items():
+            page = await context.new_page()
+            m3u8 = await extract_m3u8_from_voe(page, voe_url)
+            await page.close()
+
+            if not m3u8:
+                continue
+
+            q = 1080
+            ql = quality.lower()
+            if "4k" in ql or "2160" in ql:
+                q = 2160
+            elif "720" in ql:
+                q = 720
+            elif "480" in ql:
+                q = 480
+
+            name = f"World4uFree [VOE] {q}p"
+
+            results.append({
+                "name": name,
+                "label": name,
+                "url": m3u8,
+                "type": "m3u8",
+                "quality": q,
+                "headers": {
+                    "Referer": "https://voe.sx"
+                }
+            })
+
+        await browser.close()
+
+    return results
+
+
 
 # =====================================================================
 # API ENDPOINT
@@ -2004,7 +2876,6 @@ async def api_search(request: SearchRequest):
     title_q, year_q = split_query_title_year(request.query)
 
     try:
-        # Run 4K and MoviesDrive search in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
             f_4k = ex.submit(search_4k, request.query)
             f_md = ex.submit(md_search_movies, request.query)
@@ -2022,7 +2893,6 @@ async def api_search(request: SearchRequest):
                 base_title = m.group(1)
                 year_r = int(m.group(2))
 
-            # For speed, skip extra load_4k(year) refinement; rely on title + optional year in title.
             if not titles_match(title_q, base_title):
                 continue
             if year_q is not None and year_r is not None and year_r != year_q:
@@ -2073,6 +2943,12 @@ async def api_search(request: SearchRequest):
                 combined_map[key] = r
 
         final_results = list(combined_map.values())
+
+        final_results.sort(
+            key=lambda item: relevance_score(request.query, item),
+            reverse=True
+        )
+
 
         return {
             "status": "success",
@@ -2169,7 +3045,6 @@ async def api_get_links(request: LinksRequest):
                     detail="No download variants found for this content"
                 )
 
-            # LIMIT how many we expand to keep response fast
             if len(variants) > MAX_VARIANTS_PER_ENTRY:
                 variants = sorted(variants, key=lambda v: v.get("quality", 0), reverse=True)[
                     :MAX_VARIANTS_PER_ENTRY
@@ -2190,7 +3065,6 @@ async def api_get_links(request: LinksRequest):
                     except Exception as e:
                         logger.warning(f"[collect] error: {e}")
 
-            # IMPORTANT: keep all unique URLs (no resolving or host filtering here)
             filtered = []
             seen = set()
             for item in collected:
@@ -2363,14 +3237,12 @@ def extract_links(req: HubDriveRequest):
             detail="No hubdrive links provided"
         )
 
-    # LIMIT number of links per call to keep latency low
     incoming_links = req.hubdrive_links[:MAX_EXTRACT_LINKS]
 
     all_links: List[Dict] = []
     failed_count = 0
     md_video_pages: List[str] = []
 
-    # --- CONCURRENT per-URL processing ---
     max_workers = min(len(incoming_links), 10) or 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
@@ -2393,7 +3265,6 @@ def extract_links(req: HubDriveRequest):
             if md_page:
                 md_video_pages.append(md_page)
 
-    # --- MoviesDrive / generic pages (already batched) ---
     if md_video_pages:
         try:
             md_resolved = md_resolve_all(md_video_pages)
@@ -2415,14 +3286,11 @@ def extract_links(req: HubDriveRequest):
             logger.warning(f"[extract] MoviesDrive resolve failed: {e}")
             failed_count += len(md_video_pages)
 
-    # --- Final filtering ---
     filtered_links = [
         x for x in all_links
         if (x.get("server") or "").strip().lower() != "unknown server"
     ]
 
-    # Instead of raising 404/503, always return success with whatever we have.
-    # Client should check total_links and failed_count.
     if not filtered_links:
         logger.warning(
             f"[extract] No valid download links; failed_count={failed_count}, incoming={len(incoming_links)}"
@@ -2434,7 +3302,6 @@ def extract_links(req: HubDriveRequest):
             "failed_count": failed_count
         }
 
-    # FAST mode: skip size probing
     if FAST_EXTRACT_MODE:
         return {
             "status": "success",
@@ -2443,7 +3310,6 @@ def extract_links(req: HubDriveRequest):
             "failed_count": failed_count
         }
 
-    # --- Optional: size probing (still concurrent) ---
     def _fetch_size(idx: int, item: Dict) -> Tuple[int, Optional[int]]:
         if "size_bytes" in item and item.get("size_bytes") is not None:
             return idx, item["size_bytes"]
@@ -2490,13 +3356,6 @@ async def get_cinemaos(
     year: Optional[int] = Query(None),
     imdb_id: Optional[str] = Query(None),
 ):
-    """
-    /cinemaos endpoint that mirrors the Kotlin client:
-    - Uses /api/provider
-    - Builds content string and computes secret with cinemaos_generate_hash (Kotlin port)
-    - Decrypts response using cinemaos_decrypt_response
-    - Returns 'sources' list with headers and debug info
-    """
     is_series = season is not None
     tmdb_str = str(tmdb_id)
     season_str = str(season) if season is not None else ""
@@ -2504,7 +3363,11 @@ async def get_cinemaos(
     fix_title = quote_plus(title) if title else ""
     imdb_val = imdb_id or ""
 
-    cache_key = make_cache_key(tmdb_id, season, episode, title, year, imdb_id)
+    # 🔴 IMPORTANT: version cache to avoid poisoned old entries
+    cache_key = make_cache_key(
+        tmdb_id, season, episode, title, year, imdb_id, "w4u-v1"
+    )
+
     cached = cache_get(cache_key)
     if cached is not None:
         cached_copy = json.loads(json.dumps(cached))
@@ -2512,11 +3375,11 @@ async def get_cinemaos(
             cached_copy["debug"]["cached"] = True
         return cached_copy
 
-    # generate secret using Kotlin-style function
     secret = cinemaos_generate_hash(tmdb_str, season_str, episode_str, is_series)
 
     typ = "tv" if is_series else "movie"
     base_path = f"{CINEMAOS_API}/api/provider"
+
     if is_series:
         url = (
             f"{base_path}?type={typ}"
@@ -2544,17 +3407,11 @@ async def get_cinemaos(
         "Connection": "keep-alive",
         "Referer": CINEMAOS_API,
         "Host": urlparse(CINEMAOS_API).netloc,
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/139.0.0.0 Safari/537.36"
         ),
-        "sec-ch-ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
         "Content-Type": "application/json",
     }
 
@@ -2569,29 +3426,44 @@ async def get_cinemaos(
     try:
         body = resp.json()
     except Exception:
-        body = resp.text
+        raise HTTPException(status_code=502, detail="cinemaos returned invalid json")
 
-    if isinstance(body, dict) and "data" in body:
-        data_field = body["data"]
-    else:
+    if "data" not in body:
         raise HTTPException(
             status_code=502,
-            detail=f"unexpected cinemaos response format (missing 'data'), raw: {str(body)[:400]}"
+            detail="unexpected cinemaos response format (missing data)"
         )
 
     try:
-        decrypted = cinemaos_decrypt_response(data_field)
+        decrypted = cinemaos_decrypt_response(body["data"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"decryption failed: {e}")
 
     try:
-        sources = parse_cinemaos_sources(decrypted)
+        cinemaos_sources = parse_cinemaos_sources(decrypted)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"parsing decrypted payload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"cinemaos parse failed: {e}")
 
     final_sources = []
-    for it in sources:
-        url_val = it.get("url", "") or ""
+
+    # ============================================================
+    # 0. World4uFree — MUST RUN IN THREADPOOL (CRITICAL FIX)
+    # ============================================================
+    w4u_sources = []
+    try:
+        w4u_sources = await get_world4ufree_sources(title or "")
+        logger.info(f"[cinemaos] World4uFree added {len(w4u_sources)} m3u8 sources")
+    except Exception as e:
+        logger.error(f"[cinemaos] World4uFree failed: {e}", exc_info=True)
+
+    final_sources.extend(w4u_sources)
+
+
+    # ============================================================
+    # 1. CinemaOS decrypted sources
+    # ============================================================
+    for it in cinemaos_sources:
+        url_val = it.get("url")
         if not url_val:
             continue
 
@@ -2605,16 +3477,28 @@ async def get_cinemaos(
         name_raw = f"CinemaOS [{server}] {bitrate} {it.get('speed','')}"
         name = clean_name(name_raw)
 
-        final_sources.append(
-            {
-                "name": name,
-                "label": name,
-                "url": url_val,
-                "type": extractor_type,
-                "quality": quality_val,
-                "headers": {"Referer": CINEMAOS_API},
-            }
+        final_sources.append({
+            "name": name,
+            "label": name,
+            "url": url_val,
+            "type": extractor_type,
+            "quality": quality_val,
+            "headers": {"Referer": CINEMAOS_API},
+        })
+
+    # ============================================================
+    # 2. Watch32 — CALL ONCE
+    # ============================================================
+    try:
+        watch32_sources = get_watch32_sources(
+            title=title,
+            season=season,
+            episode=episode,
         )
+    except Exception:
+        watch32_sources = []
+
+    final_sources.extend(watch32_sources)
 
     response_payload = {
         "sources": final_sources,
@@ -2623,12 +3507,16 @@ async def get_cinemaos(
             "source_count": len(final_sources),
             "upstream_url": url,
             "cached": False,
+            "addons": {
+                "world4ufree": len(w4u_sources),
+                "cinemaos": len(final_sources) - len(w4u_sources) - len(watch32_sources),
+                "watch32": len(watch32_sources),
+            },
         },
     }
 
     cache_put(cache_key, response_payload)
     return response_payload
-
 
 # =====================================================================
 # Entrypoint
